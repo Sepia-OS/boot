@@ -1,0 +1,142 @@
+name: CI
+
+# Every commit on every branch, every pull request against main, and the push
+# that lands when a pull request is merged into main.
+#
+# Tag pushes deliberately do not match: `branches:` never matches a tag ref, so
+# cutting a release cannot start a second pipeline for the commit it just built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede the previous run for the same branch or PR. A branch that also has
+# an open PR gets one run per event in two separate groups, so neither run can
+# cancel the other's checks out from under branch protection.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Hosted runners are x86_64, so the AArch64 kernels run under full TCG
+  # emulation. Correct, but far slower than an arm64 host: the Makefile's
+  # 40 second default is not enough headroom.
+  QEMU_TIMEOUT: 180
+
+jobs:
+  # -------------------------------------------------------------------------
+  # One job per board. The four with a QEMU machine are booted; pi5 and cm5
+  # are built only, because QEMU has no BCM2712 machine type at all.
+  # -------------------------------------------------------------------------
+  board:
+    name: ${{ matrix.board }}
+    runs-on: ubuntu-latest
+    # QEMU's raspi4b machine arrived in QEMU 9.0. Debian 12 ships 7.2 and
+    # Ubuntu 24.04 ships 8.2, so on the bare runner pi4 and cm4 could not be
+    # booted at all. Trixie ships QEMU 10.x. Before changing this image, check
+    # `qemu-system-aarch64 -machine help | grep raspi4b`.
+    container: debian:trixie-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: pi-zero2w
+            emulate: true
+          - board: pi3
+            emulate: true
+          - board: pi4
+            emulate: true
+          - board: cm4
+            emulate: true
+          - board: pi5
+            emulate: false
+          - board: cm5
+            emulate: false
+    steps:
+      # Before checkout on purpose: without git in the container, actions/checkout
+      # silently falls back to downloading a tarball, and the Makefile needs git
+      # for the sparse overlays clone.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make mtools qemu-system-arm git curl ca-certificates bsdextrautils
+
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: make BOARD=${{ matrix.board }} image
+
+      - name: List what ended up on the partition
+        run: make BOARD=${{ matrix.board }} verify
+
+      - name: Boot under QEMU
+        if: matrix.emulate
+        run: make BOARD=${{ matrix.board }} boot-check
+
+      - name: This board has no QEMU machine
+        if: ${{ !matrix.emulate }}
+        run: |
+          echo "::notice title=${{ matrix.board }}::BCM2712 has no QEMU machine type;" \
+               "the image is built but can only be booted on real hardware."
+
+      - name: Upload the serial log
+        if: failure() && matrix.emulate
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-${{ matrix.board }}
+          path: build/${{ matrix.board }}/boot.log
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # The all-boards card, which is what a release ships. Gated to main so pull
+  # requests stay at six jobs. `release.yml` is triggered by hand, but it looks
+  # for a successful run of *this* workflow on the commit being released and
+  # refuses to publish without one - so this job is the gate a release passes.
+  # -------------------------------------------------------------------------
+  universal:
+    name: universal card
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make mtools qemu-system-arm git curl ca-certificates bsdextrautils
+
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: make BOARD=universal image
+
+      # The manifest in checksums/ covers exactly the universal artifact set,
+      # so this is the one board where it can be checked in full.
+      - name: Check downloads against the pinned manifest
+        run: make BOARD=universal verify-firmware
+
+      - name: List what ended up on the partition
+        run: make BOARD=universal verify
+
+      # One card, four machines: this is the claim a universal image makes, so
+      # it is the claim CI tests.
+      - name: Boot the same card as every emulable board
+        run: |
+          for board in pi-zero2w pi3 pi4 cm4; do
+            make BOARD=universal QEMU_BOARD="$board" \
+                 QEMU_LOG="build/universal/boot-$board.log" boot-check
+          done
+
+      - name: Upload the serial logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-universal
+          path: build/universal/boot-*.log
+          if-no-files-found: ignore
