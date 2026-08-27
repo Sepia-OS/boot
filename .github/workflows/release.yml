@@ -39,6 +39,7 @@ jobs:
   gate:
     name: check the version and the commit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       asset: ${{ steps.version.outputs.asset }}
@@ -119,6 +120,7 @@ jobs:
     name: build the universal card
     needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container: debian:trixie-slim
     outputs:
       firmware: ${{ steps.firmware.outputs.firmware }}
@@ -132,7 +134,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             make mtools git curl ca-certificates bsdextrautils xz-utils
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read the pinned firmware tag
         id: firmware
@@ -162,7 +164,7 @@ jobs:
 
       # compression-level 0: the payload is already xz -9, so zipping it again
       # only burns CPU.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-assets
           path: dist/
@@ -182,10 +184,11 @@ jobs:
     name: publish the release
     needs: [gate, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-assets
           path: dist

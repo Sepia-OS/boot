@@ -36,6 +36,7 @@ jobs:
   board:
     name: ${{ matrix.board }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # QEMU's raspi4b machine arrived in QEMU 9.0. Debian 12 ships 7.2 and
     # Ubuntu 24.04 ships 8.2, so on the bare runner pi4 and cm4 could not be
     # booted at all. Trixie ships QEMU 10.x. Before changing this image, check
@@ -67,7 +68,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             make mtools qemu-system-arm git curl ca-certificates bsdextrautils
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the image
         run: make BOARD=${{ matrix.board }} image
@@ -87,7 +88,7 @@ jobs:
 
       - name: Upload the serial log
         if: failure() && matrix.emulate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: boot-log-${{ matrix.board }}
           path: build/${{ matrix.board }}/boot.log
@@ -103,6 +104,7 @@ jobs:
     name: universal card
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: debian:trixie-slim
     steps:
       - name: Install build tools
@@ -111,7 +113,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             make mtools qemu-system-arm git curl ca-certificates bsdextrautils
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the image
         run: make BOARD=universal image
@@ -135,7 +137,7 @@ jobs:
 
       - name: Upload the serial logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: boot-log-universal
           path: build/universal/boot-*.log

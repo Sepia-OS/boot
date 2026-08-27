@@ -72,6 +72,24 @@ Leading and trailing whitespace is trimmed, but internal whitespace is
 rejected rather than removed: silently turning a fat-fingered `1.0 0` into
 `1.00` would release the wrong version under a plausible-looking tag.
 
+### How long a release takes, and why
+
+The build is fast — about 40 seconds. Publishing is not: uploading the ~21 MiB
+`.img.xz` to GitHub's release-asset endpoint has been measured at **14 minutes**
+(≈25 KiB/s), and the run sits in `publish the release` for all of it with no
+output. That is normal, not a hang. The release object and `SHA256SUMS` appear
+within two seconds; it is only the big asset that crawls.
+
+The payload cannot usefully be shrunk. `kernel8.img` and `kernel_2712.img` are
+already-compressed kernel images that `xz -9` only takes from 10.0 MiB to
+9.8 MiB each, so 19.6 of the 21.2 MiB is irreducible without dropping boards
+from the card. Everything else — 371 overlays, both `start*.elf`, every DTB —
+compresses to about 1.5 MiB combined.
+
+Every job carries a `timeout-minutes` so a genuine stall fails in tens of
+minutes instead of running to the six-hour default. `publish` allows 45, roughly
+three times the worst observed upload.
+
 ### Why the release is built twice
 
 `build` rebuilds rather than reusing CI's artifact, in the same container image,
@@ -159,6 +177,12 @@ The base image's QEMU is older than 9.0. See the note above.
 
 **CI passed but no release appeared.**
 Expected — releases are never automatic. Trigger `Release` by hand.
+
+**The release seems stuck on `publish the release`.**
+Almost certainly not stuck. `gh release create` uploads the ~21 MiB asset with
+no progress output, and that upload has been observed to take 14 minutes. Check
+the release page: if the tag and `SHA256SUMS` are already there, the big asset
+is still on its way. The job's `timeout-minutes: 45` is the real backstop.
 
 **`No green CI run`.**
 The commit you are releasing from has no successful `ci.yml` run. Either it was
