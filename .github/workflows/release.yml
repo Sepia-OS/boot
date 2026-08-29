@@ -1,12 +1,20 @@
 name: Release
 
 # Publishes the all-boards card. Manual on purpose: the version is a human
-# decision, so the person cutting the release types it in. Pick the branch or
-# tag to release from in the same dialog — `github.sha` follows that choice.
+# decision, so the person cutting the release types it in.
+#
+# main is branched into rel-<version> and the build runs on that branch, so the
+# released commit is a thing that still exists afterwards and main can move on
+# underneath it. The ref this workflow is dispatched on is therefore ignored:
+# the release always comes from main's head at the moment the gate runs.
 #
 # The gate that a `workflow_run` trigger would have given for free is enforced
 # explicitly instead: the `gate` job refuses to release a commit that CI has not
 # passed on.
+#
+# Creating the branch is a push, so ci.yml runs on it as well. That duplicate
+# build costs a runner and delays nothing, and "every branch is built" is the
+# rule the README asks for.
 on:
   workflow_dispatch:
     inputs:
@@ -37,12 +45,16 @@ jobs:
   # full image build.
   # -------------------------------------------------------------------------
   gate:
-    name: check the version and the commit
+    name: check the version, then branch main
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       asset: ${{ steps.version.outputs.asset }}
+      branch: ${{ steps.version.outputs.branch }}
+      sha: ${{ steps.main.outputs.sha }}
     steps:
       # `inputs.version` is attacker-controlled text. It is passed through the
       # environment rather than interpolated into the script, because `${{ }}`
@@ -71,30 +83,49 @@ jobs:
           tag="v${version}"
           {
             echo "tag=${tag}"
+            echo "branch=rel-${version}"
             echo "asset=sepiaos-boot-universal-${tag}.img.xz"
           } >> "$GITHUB_OUTPUT"
-          echo "Releasing ${tag} from ${GITHUB_SHA}"
+          echo "Releasing ${tag} from rel-${version}"
 
-      # A manual trigger cannot inherit "CI passed on this commit" the way an
-      # automatic one would, so it is asked for outright.
-      - name: Require a green CI run for this commit
+      # Resolved once, here, and then used for everything downstream: the CI
+      # check, the branch, the release target and the commit named in the
+      # notes. Reading main's head again later would open a window where CI was
+      # checked on one commit and another was released.
+      - name: Resolve the head of main
+        id: main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ -n "$sha" ] || { echo "::error::could not read the head of main"; exit 1; }
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "main is at ${sha}"
+
+      # A manual trigger cannot inherit "CI passed on this commit" the way an
+      # automatic one would, so it is asked for outright - and asked about the
+      # commit being released, which is main's head rather than whatever ref
+      # this workflow happened to be dispatched on.
+      - name: Require a green CI run for that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.main.outputs.sha }}
+        run: |
           runs="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&status=success" \
             --jq '.total_count' 2>/dev/null || echo 0)"
           if [ "${runs:-0}" -eq 0 ]; then
-            echo "::error title=No green CI run::${GITHUB_SHA} has no successful" \
+            echo "::error title=No green CI run::main (${SHA}) has no successful" \
                  "CI run. Push it, wait for CI, then release — or re-run CI on it."
             exit 1
           fi
-          echo "CI passed on ${GITHUB_SHA} (${runs} successful run(s))"
+          echo "CI passed on ${SHA} (${runs} successful run(s))"
 
-      - name: Refuse to overwrite an existing release
+      - name: Refuse to overwrite an existing release, tag or branch
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          BRANCH: ${{ steps.version.outputs.branch }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error title=${TAG} already released::Pick a different version," \
@@ -110,6 +141,25 @@ jobs:
                  "a different version."
             exit 1
           fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            echo "::error title=${BRANCH} already exists::A release branch for" \
+                 "this version is already there. Delete it" \
+                 "(git push --delete origin ${BRANCH}) or pick a different version."
+            exit 1
+          fi
+
+      # Created before the build rather than after it, because the build has to
+      # run *on* the release branch - that is what makes the released commit
+      # something that still exists whatever main does next.
+      - name: Branch main into the release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+          SHA: ${{ steps.main.outputs.sha }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/heads/${BRANCH}" -f "sha=${SHA}" >/dev/null
+          echo "Branched main (${SHA}) into ${BRANCH}"
 
   # -------------------------------------------------------------------------
   # Built in the same container CI verified in. mtools decides the FAT layout,
@@ -134,7 +184,11 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             make mtools git curl ca-certificates bsdextrautils xz-utils
 
+      # The release branch, not the dispatched ref: this is the whole point of
+      # having branched.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.branch }}
 
       - name: Read the pinned firmware tag
         id: firmware
@@ -198,6 +252,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.gate.outputs.tag }}
           ASSET: ${{ needs.gate.outputs.asset }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+          SHA: ${{ needs.gate.outputs.sha }}
           FIRMWARE: ${{ needs.build.outputs.firmware }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
@@ -208,7 +264,8 @@ jobs:
 
           | | |
           |---|---|
-          | Commit | \`${GITHUB_SHA}\` |
+          | Commit | \`${SHA}\` |
+          | Branch | \`${BRANCH}\` |
           | Raspberry Pi firmware | \`${FIRMWARE}\` |
 
           This is a **boot partition only**. On its own it takes the kernel as
@@ -235,9 +292,38 @@ jobs:
 
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$BRANCH" \
             --title "SepiaOS boot $TAG" \
             --notes-file notes.md \
             "${flag[@]}" \
             "dist/$ASSET" \
             dist/SHA256SUMS
+
+  # -------------------------------------------------------------------------
+  # The branch is created before the build, so a build that fails leaves one
+  # behind - and the gate would then refuse the retry, because the branch
+  # already exists. It holds nothing main does not: it was created seconds
+  # earlier as a pointer to main's head, and nothing commits to it. So it is
+  # removed again and the same version can be released once whatever failed is
+  # fixed. The tag and the release are never reached on this path.
+  # -------------------------------------------------------------------------
+  rollback:
+    name: remove the release branch again
+    needs: [gate, build]
+    if: failure() && needs.gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+        run: |
+          if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"; then
+            echo "::notice title=Rolled back::${BRANCH} was deleted; the release can be retried."
+          else
+            echo "::warning title=Branch left behind::${BRANCH} could not be deleted." \
+                 "Delete it by hand before retrying this version."
+          fi

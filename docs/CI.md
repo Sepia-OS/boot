@@ -31,15 +31,40 @@ a human decision, so a human types it in. Run it from the Actions tab → Releas
 
 | Field | |
 |---|---|
-| *Use workflow from* | branch or tag to release — this is the commit that gets built and tagged |
+| *Use workflow from* | ignored — the release always comes from `main`'s head, whatever ref is selected here |
 | `version` | required, e.g. `2026.08.27`, `1.0.0` or `1.0.0-rc1`; a leading `v` is added if you leave it off |
 | `prerelease` | tick to publish without marking it Latest |
 
 | Job | Runs on | What |
 |---|---|---|
-| `gate` | bare `ubuntu-latest` | validates the version, requires a green CI run for the commit, refuses a taken tag |
-| `build` | `debian:trixie-slim` | rebuilds the universal card, re-checks the pinned manifest, `xz -9`, checksums |
-| `publish` | bare `ubuntu-latest` | creates the tag and the release, uploads both assets |
+| `gate` | bare `ubuntu-latest` | validates the version, resolves `main`'s head, requires a green CI run for *that* commit, refuses a taken tag, release or branch, then branches `main` into `rel-<version>` |
+| `build` | `debian:trixie-slim` | checks out `rel-<version>`, rebuilds the universal card, re-checks the pinned manifest, `xz -9`, checksums |
+| `publish` | bare `ubuntu-latest` | creates the tag and the release on `rel-<version>`, uploads both assets |
+| `rollback` | bare `ubuntu-latest` | on failure, deletes `rel-<version>` again |
+
+### The release branch
+
+`main` is branched into `rel-<version>` before the build, and the build runs on
+that branch. That is what makes the released commit something that still
+exists afterwards: `main` can move on underneath it, and the exact tree that
+was built and tagged is still reachable by name.
+
+Two consequences follow from creating the branch *before* the build:
+
+- **Creating it is a push, so `ci.yml` runs on it too.** That duplicate build
+  costs a runner and delays nothing, and "every branch is built" is the rule
+  this repository works to.
+- **A failed build would leave the branch behind**, and the gate would then
+  refuse the retry because the branch exists. So `rollback` deletes it again on
+  failure. It holds nothing `main` does not — it was created seconds earlier as
+  a pointer to `main`'s head and nothing ever commits to it — so the same
+  version can be released again once the failure is fixed. The tag and the
+  release are never reached on that path.
+
+`main`'s head is resolved **once**, in the gate, and that one SHA is then used
+for the CI check, the branch, the release target and the commit named in the
+notes. Reading it again later would open a window where CI was checked on one
+commit and a different one was released.
 
 The release is tagged `v<version>` and carries two assets:
 
@@ -58,7 +83,8 @@ after a full image build.
 It is also where the safety property lives. An automatic trigger would give
 "CI passed on this commit" for free; a manual trigger cannot, so `gate` asks the
 API for a successful `ci.yml` run whose `head_sha` is the commit being released
-and stops if there is none.
+— `main`'s head, not whatever ref the workflow was dispatched on — and stops if
+there is none.
 
 ### Why the version is passed through the environment
 
